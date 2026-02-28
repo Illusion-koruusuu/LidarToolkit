@@ -89,16 +89,12 @@ public:
 
     publish_filtered_cloud_ = this->declare_parameter<bool>("publish_filtered_cloud", true);
 
-    // PointCloud2 在 RViz 中通常使用 SensorData QoS（best effort）。
-    const auto cloud_qos = rclcpp::SensorDataQoS();
-    cloud_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("input_cloud", cloud_qos);
+    const auto qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
+    cloud_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("input_cloud", qos);
     if (publish_filtered_cloud_) {
-      filtered_cloud_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("filtered_cloud", cloud_qos);
+      filtered_cloud_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("filtered_cloud", qos);
     }
-
-    // MarkerArray 用默认 reliable QoS 即可。
-    const auto marker_qos = rclcpp::QoS(rclcpp::KeepLast(10)).reliable();
-    markers_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>("cluster_boxes", marker_qos);
+    markers_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>("cluster_boxes", qos);
 
     const auto period = std::chrono::duration<double>(1.0 / std::max(0.1, publish_rate_hz_));
     timer_ = this->create_wall_timer(
