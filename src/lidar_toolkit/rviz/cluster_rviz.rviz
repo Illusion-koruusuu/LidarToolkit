@@ -30,6 +30,12 @@ Visualization Manager:
       Plane Cell Count: 10
       Reference Frame: <Fixed Frame>
       Value: true
+    - Class: rviz_default_plugins/Axes
+      Enabled: true
+      Name: Axes
+      Reference Frame: <Fixed Frame>
+      Length: 1
+      Radius: 0.05
     - Class: rviz_default_plugins/PointCloud2
       Enabled: true
       Name: InputCloud
@@ -42,6 +48,21 @@ Visualization Manager:
       Alpha: 1
       Color Transformer: Intensity
       Autocompute Intensity Bounds: true
+      Use Fixed Frame: true
+      Reliability Policy: Best Effort
+      Durability Policy: Volatile
+    - Class: rviz_default_plugins/PointCloud2
+      Enabled: true
+      Name: FilteredCloud
+      Topic:
+        Value: /filtered_cloud
+      Queue Size: 10
+      Style: Flat Squares
+      Size (Pixels): 3
+      Size (m): 0.01
+      Alpha: 1
+      Color Transformer: FlatColor
+      Color: 255; 255; 0
       Use Fixed Frame: true
       Reliability Policy: Best Effort
       Durability Policy: Volatile
