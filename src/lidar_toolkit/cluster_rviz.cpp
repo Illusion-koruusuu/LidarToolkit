@@ -5,6 +5,7 @@
 
 #include <pcl/ModelCoefficients.h>
 #include <pcl/common/common.h>
+#include <pcl/filters/crop_box.h>
 #include <pcl/filters/extract_indices.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/io/pcd_io.h>
@@ -17,7 +18,10 @@
 
 #include <pcl_conversions/pcl_conversions.h>
 
+#include <Eigen/Core>
+
 #include <cmath>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -30,6 +34,7 @@ struct Rgb
   float b;
 };
 
+// HSV 转 RGB 的简单实现
 Rgb hsvToRgb(float h, float s, float v)
 {
   h = std::fmod(h, 360.0f);
@@ -79,13 +84,17 @@ public:
 
     publish_rate_hz_ = this->declare_parameter<double>("publish_rate_hz", 1.0);
 
-    voxel_leaf_size_ = this->declare_parameter<double>("voxel_leaf_size", 0.05);
-    plane_distance_threshold_ = this->declare_parameter<double>("plane_distance_threshold", 0.02);
+    voxel_leaf_size_ = this->declare_parameter<double>("voxel_leaf_size", 0.02); // 体素滤波的叶子大小
+    plane_distance_threshold_ = this->declare_parameter<double>("plane_distance_threshold", 0.06); // 平面分割的距离阈值
     plane_max_iterations_ = this->declare_parameter<int>("plane_max_iterations", 100);
 
-    cluster_tolerance_ = this->declare_parameter<double>("cluster_tolerance", 0.1);
+    cluster_tolerance_ = this->declare_parameter<double>("cluster_tolerance", 0.1); // 聚类距离阈值（需要大于voxel_leaf_size_）
     min_cluster_size_ = this->declare_parameter<int>("min_cluster_size", 100);
     max_cluster_size_ = this->declare_parameter<int>("max_cluster_size", 25000);
+
+    enable_crop_box_ = this->declare_parameter<bool>("enable_crop_box", false);
+    crop_min_ = this->declare_parameter<std::vector<double>>("crop_min", std::vector<double>{-3.0, -3.0, -3.0});
+    crop_max_ = this->declare_parameter<std::vector<double>>("crop_max", std::vector<double>{3.0, 3.0, 3.0});
 
     publish_filtered_cloud_ = this->declare_parameter<bool>("publish_filtered_cloud", true);
 
@@ -113,6 +122,23 @@ private:
     }
     std::cout << "PointCloud before filtering has: " << cloud->size () << " data points." << std::endl; // 输出点云数量（滤波前）
 
+    // 裁剪：用一个立方体范围 [crop_min, crop_max] 保留目标空间
+    if (enable_crop_box_) 
+    {
+      pcl::CropBox<pcl::PointXYZ> crop;
+      crop.setInputCloud(cloud);
+      crop.setMin(Eigen::Vector4f(
+        static_cast<float>(crop_min_[0]), static_cast<float>(crop_min_[1]), static_cast<float>(crop_min_[2]), 1.0f));
+      crop.setMax(Eigen::Vector4f(
+        static_cast<float>(crop_max_[0]), static_cast<float>(crop_max_[1]), static_cast<float>(crop_max_[2]), 1.0f));
+
+      pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_cropped(new pcl::PointCloud<pcl::PointXYZ>);
+      crop.filter(*cloud_cropped);
+      cloud = cloud_cropped;
+      std::cout << "PointCloud after crop has: " << cloud->size () << " data points." << std::endl;
+    }
+
+    // 发布“后续处理所用的输入点云”（裁剪后）
     publishCloud(*cloud, cloud_pub_);
 
     // 体素滤波下采样
@@ -137,6 +163,7 @@ private:
     seg.setDistanceThreshold(static_cast<float>(plane_distance_threshold_));
 
     const int nr_points = static_cast<int>(cloud_filtered->size());
+    // 迭代分割并移除平面，直到剩余点云数量小于原始数量的 30%
     while (cloud_filtered->size() > 0.3 * nr_points) 
     {
       // 从剩余点云中分割出最大的平面成分
@@ -182,7 +209,17 @@ private:
 
     rclcpp::Time stamp = this->now();
 
+    // 先清空上一次的 marker，避免聚类数量变少时旧框残留
+    {
+      visualization_msgs::msg::Marker clear;
+      clear.header.frame_id = frame_id_;
+      clear.header.stamp = stamp;
+      clear.action = visualization_msgs::msg::Marker::DELETEALL;
+      marker_array.markers.push_back(std::move(clear));
+    }
+
     int id = 0;
+    int robot_num = 0;
     for (const auto & cluster : cluster_indices) {
       pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_cluster(new pcl::PointCloud<pcl::PointXYZ>);
       cloud_cluster->reserve(cluster.indices.size());
@@ -201,6 +238,12 @@ private:
       const float sx = std::max(0.001f, max_pt.x - min_pt.x);
       const float sy = std::max(0.001f, max_pt.y - min_pt.y);
       const float sz = std::max(0.001f, max_pt.z - min_pt.z);
+
+      // 判断聚类框的尺寸是否在合理范围内
+      constexpr float kRobotMaxSizeM = 2.0f,
+                      kRobotMinSizeM = 0.15f;
+      const bool is_robot_box = (sx < kRobotMaxSizeM) && (sy < kRobotMaxSizeM) && (sz < kRobotMaxSizeM) &&
+                                (sx > kRobotMinSizeM) && (sz > kRobotMinSizeM);
 
       visualization_msgs::msg::Marker m;
       m.header.frame_id = frame_id_;
@@ -229,12 +272,41 @@ private:
       m.lifetime = rclcpp::Duration(0, 0);
 
       marker_array.markers.push_back(std::move(m));
+
+      // 如果尺寸合理，认为是机器人并添加文本标签
+      if (is_robot_box) {
+        visualization_msgs::msg::Marker t;
+        t.header.frame_id = frame_id_;
+        t.header.stamp = stamp;
+        t.ns = "robot_labels";
+        t.id = id - 1;
+        t.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
+        t.action = visualization_msgs::msg::Marker::ADD;
+
+        t.pose.position.x = cx;
+        t.pose.position.y = cy;
+        t.pose.position.z = max_pt.z + 0.05f;
+        t.pose.orientation.w = 1.0;
+
+        t.scale.z = 0.2f;
+        t.color.r = 1.0f;
+        t.color.g = 1.0f;
+        t.color.b = 1.0f;
+        t.color.a = 0.9f;
+        t.text = std::string("robot_") + std::to_string(robot_num++);
+
+        t.lifetime = rclcpp::Duration(0, 0);
+        marker_array.markers.push_back(std::move(t));
+      }
     }
 
     markers_pub_->publish(marker_array);
 
     RCLCPP_INFO(
-      this->get_logger(), "发布点云与 %zu 个聚类立方体框。PCD=%s", marker_array.markers.size(),
+      this->get_logger(),
+      "发布点云：聚类框=%zu，robot标签=%u。PCD路径=%s",
+      cluster_indices.size(),
+      robot_num,
       pcd_path_.c_str());
   }
 
@@ -261,6 +333,10 @@ private:
   double cluster_tolerance_{};
   int min_cluster_size_{};
   int max_cluster_size_{};
+
+  bool enable_crop_box_{};
+  std::vector<double> crop_min_{};
+  std::vector<double> crop_max_{};
 
   bool publish_filtered_cloud_{};
 

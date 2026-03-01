@@ -23,6 +23,10 @@ def generate_launch_description():
     max_cluster_size = LaunchConfiguration('max_cluster_size')
     publish_filtered_cloud = LaunchConfiguration('publish_filtered_cloud')
 
+    enable_crop_box = LaunchConfiguration('enable_crop_box')
+    crop_min = LaunchConfiguration('crop_min')
+    crop_max = LaunchConfiguration('crop_max')
+
     return LaunchDescription([
         DeclareLaunchArgument(
             'pcd_path',
@@ -46,7 +50,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'plane_distance_threshold',
-            default_value='0.02',
+            default_value='0.06',
             description='RANSAC plane distance threshold (m)',
         ),
         DeclareLaunchArgument(
@@ -56,12 +60,12 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'cluster_tolerance',
-            default_value='0.1',
+            default_value='0.4',
             description='Euclidean cluster tolerance (m)',
         ),
         DeclareLaunchArgument(
             'min_cluster_size',
-            default_value='100',
+            default_value='20',
             description='Min points per cluster',
         ),
         DeclareLaunchArgument(
@@ -73,6 +77,21 @@ def generate_launch_description():
             'publish_filtered_cloud',
             default_value='true',
             description='Whether to publish /filtered_cloud (true/false)',
+        ),
+        DeclareLaunchArgument(
+            'enable_crop_box',
+            default_value='true',
+            description='Enable CropBox cropping (true/false)',
+        ),
+        DeclareLaunchArgument(
+            'crop_min',
+            default_value='[-2.6, 6.5, -0.1]',
+            description='CropBox min corner [x,y,z]',
+        ),
+        DeclareLaunchArgument(
+            'crop_max',
+            default_value='[2.6, 9.0, 1.0]',
+            description='CropBox max corner [x,y,z]',
         ),
         Node(
             package='LidarToolkit',
@@ -90,6 +109,9 @@ def generate_launch_description():
                 'min_cluster_size': min_cluster_size,
                 'max_cluster_size': max_cluster_size,
                 'publish_filtered_cloud': publish_filtered_cloud,
+                'enable_crop_box': enable_crop_box,
+                'crop_min': crop_min,
+                'crop_max': crop_max,
             }],
         ),
         Node(
