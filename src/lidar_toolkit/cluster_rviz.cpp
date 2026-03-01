@@ -79,11 +79,11 @@ public:
 
     publish_rate_hz_ = this->declare_parameter<double>("publish_rate_hz", 1.0);
 
-    voxel_leaf_size_ = this->declare_parameter<double>("voxel_leaf_size", 0.01);
+    voxel_leaf_size_ = this->declare_parameter<double>("voxel_leaf_size", 0.05);
     plane_distance_threshold_ = this->declare_parameter<double>("plane_distance_threshold", 0.02);
     plane_max_iterations_ = this->declare_parameter<int>("plane_max_iterations", 100);
 
-    cluster_tolerance_ = this->declare_parameter<double>("cluster_tolerance", 0.02);
+    cluster_tolerance_ = this->declare_parameter<double>("cluster_tolerance", 0.1);
     min_cluster_size_ = this->declare_parameter<int>("min_cluster_size", 100);
     max_cluster_size_ = this->declare_parameter<int>("max_cluster_size", 25000);
 
@@ -105,51 +105,55 @@ public:
 private:
   void computeAndPublish()
   {
+    // 加载点云数据
     pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>);
     if (pcl::io::loadPCDFile<pcl::PointXYZ>(pcd_path_, *cloud) != 0) {
       RCLCPP_ERROR(this->get_logger(), "无法读取 PCD 文件: %s", pcd_path_.c_str());
       return;
     }
+    std::cout << "PointCloud before filtering has: " << cloud->size () << " data points." << std::endl; // 输出点云数量（滤波前）
 
     publishCloud(*cloud, cloud_pub_);
 
+    // 体素滤波下采样
     pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_filtered(new pcl::PointCloud<pcl::PointXYZ>);
-    {
-      pcl::VoxelGrid<pcl::PointXYZ> vg;
-      vg.setInputCloud(cloud);
-      const float leaf = static_cast<float>(voxel_leaf_size_);
-      vg.setLeafSize(leaf, leaf, leaf);
-      vg.filter(*cloud_filtered);
-    }
+    pcl::VoxelGrid<pcl::PointXYZ> vg;
+    vg.setInputCloud(cloud);
+    const float leaf = static_cast<float>(voxel_leaf_size_);
+    vg.setLeafSize(leaf, leaf, leaf);
+    vg.filter(*cloud_filtered);
+    std::cout << "PointCloud after filtering has: " << cloud_filtered->size ()  << " data points." << std::endl; // 输出点云数量（滤波后）
 
     // 平面分割并迭代移除最大平面
     pcl::SACSegmentation<pcl::PointXYZ> seg;
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_rest(new pcl::PointCloud<pcl::PointXYZ>);
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_plane(new pcl::PointCloud<pcl::PointXYZ>);
+    pcl::PointIndices::Ptr inliers(new pcl::PointIndices);
+    pcl::ModelCoefficients::Ptr coefficients(new pcl::ModelCoefficients);
     seg.setOptimizeCoefficients(true);
     seg.setModelType(pcl::SACMODEL_PLANE);
     seg.setMethodType(pcl::SAC_RANSAC);
     seg.setMaxIterations(plane_max_iterations_);
     seg.setDistanceThreshold(static_cast<float>(plane_distance_threshold_));
 
-    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_rest(new pcl::PointCloud<pcl::PointXYZ>);
-    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_plane(new pcl::PointCloud<pcl::PointXYZ>);
-    pcl::PointIndices::Ptr inliers(new pcl::PointIndices);
-    pcl::ModelCoefficients::Ptr coefficients(new pcl::ModelCoefficients);
-
     const int nr_points = static_cast<int>(cloud_filtered->size());
-    while (cloud_filtered->size() > 0.3 * nr_points) {
+    while (cloud_filtered->size() > 0.3 * nr_points) 
+    {
+      // 从剩余点云中分割出最大的平面成分
       seg.setInputCloud(cloud_filtered);
       seg.segment(*inliers, *coefficients);
       if (inliers->indices.empty()) {
         break;
       }
 
+      // 从输入点云中提取平面内点（inliers）
       pcl::ExtractIndices<pcl::PointXYZ> extract;
       extract.setInputCloud(cloud_filtered);
       extract.setIndices(inliers);
-
       extract.setNegative(false);
+      // 获取属于平面表面的点
       extract.filter(*cloud_plane);
-
+      // 移除平面内点，提取剩余点云
       extract.setNegative(true);
       extract.filter(*cloud_rest);
       *cloud_filtered = *cloud_rest;
@@ -160,7 +164,7 @@ private:
     }
 
     // 聚类
-    pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>);
+    pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>); // 为聚类提取创建用于搜索的 KdTree 对象
     tree->setInputCloud(cloud_filtered);
 
     std::vector<pcl::PointIndices> cluster_indices;
@@ -172,6 +176,7 @@ private:
     ec.setInputCloud(cloud_filtered);
     ec.extract(cluster_indices);
 
+    // 可视化聚类结果为立方体框
     visualization_msgs::msg::MarkerArray marker_array;
     marker_array.markers.reserve(cluster_indices.size());
 
