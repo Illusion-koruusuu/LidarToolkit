@@ -20,6 +20,9 @@
 
 #include <Eigen/Core>
 
+#include <algorithm>
+#include <filesystem>
+
 #include <cmath>
 #include <limits>
 #include <string>
@@ -112,12 +115,62 @@ public:
   }
 
 private:
-  void computeAndPublish()
+  std::string nextPcdFilePath()
   {
-    // 加载点云数据
+    namespace fs = std::filesystem;
+
+    if (!pcd_list_initialized_) {
+      pcd_list_initialized_ = true;
+      pcd_files_.clear();
+      pcd_index_ = 0;
+
+      std::error_code ec;
+      const fs::path input_path(pcd_path_);
+      if (fs::is_directory(input_path, ec)) {
+        for (const auto & entry : fs::directory_iterator(input_path, ec)) {
+          if (ec) {
+            break;
+          }
+          if (!entry.is_regular_file(ec)) {
+            continue;
+          }
+          const auto & p = entry.path();
+          if (p.has_extension() && p.extension() == ".pcd") {
+            pcd_files_.push_back(p.string());
+          }
+        }
+        std::sort(pcd_files_.begin(), pcd_files_.end());
+      } else {
+        pcd_files_.push_back(pcd_path_);
+      }
+
+      if (pcd_files_.empty()) {
+        RCLCPP_ERROR(this->get_logger(), "pcd_path 是目录但未找到任何 .pcd 文件: %s", pcd_path_.c_str());
+        return {};
+      }
+    }
+
+    if (pcd_files_.empty()) {
+      return {};
+    }
+
+    if (pcd_index_ >= pcd_files_.size()) {
+      pcd_index_ = 0;
+    }
+    return pcd_files_[pcd_index_++];
+  }
+
+  void computeAndPublish()
+  {  
+    // 加载点云数据（pcd_path 可以是单个文件，也可以是包含多个 .pcd 的目录）
+    const std::string pcd_file = nextPcdFilePath();
+    if (pcd_file.empty()) {
+      return;
+    }
+
     pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>);
-    if (pcl::io::loadPCDFile<pcl::PointXYZ>(pcd_path_, *cloud) != 0) {
-      RCLCPP_ERROR(this->get_logger(), "无法读取 PCD 文件: %s", pcd_path_.c_str());
+    if (pcl::io::loadPCDFile<pcl::PointXYZ>(pcd_file, *cloud) != 0) {
+      RCLCPP_ERROR(this->get_logger(), "无法读取 PCD 文件: %s", pcd_file.c_str());
       return;
     }
     std::cout << "PointCloud before filtering has: " << cloud->size () << " data points." << std::endl; // 输出点云数量（滤波前）
@@ -240,7 +293,7 @@ private:
       const float sz = std::max(0.001f, max_pt.z - min_pt.z);
 
       // 判断聚类框的尺寸是否在合理范围内
-      constexpr float kRobotMaxSizeM = 2.0f,
+      constexpr float kRobotMaxSizeM = 1.5f,
                       kRobotMinSizeM = 0.15f;
       const bool is_robot_box = (sx < kRobotMaxSizeM) && (sy < kRobotMaxSizeM) && (sz < kRobotMaxSizeM) &&
                                 (sx > kRobotMinSizeM) && (sz > kRobotMinSizeM);
@@ -307,7 +360,7 @@ private:
       "发布点云：聚类框=%zu，robot标签=%u。PCD路径=%s",
       cluster_indices.size(),
       robot_num,
-      pcd_path_.c_str());
+      pcd_file.c_str());
   }
 
   void publishCloud(
@@ -323,6 +376,10 @@ private:
 
   std::string pcd_path_;
   std::string frame_id_;
+
+  bool pcd_list_initialized_{false};
+  std::vector<std::string> pcd_files_;
+  std::size_t pcd_index_{0};
 
   double publish_rate_hz_{};
 
