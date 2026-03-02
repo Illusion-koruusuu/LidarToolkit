@@ -19,9 +19,14 @@
 #include <pcl_conversions/pcl_conversions.h>
 
 #include <Eigen/Core>
+#include <Eigen/Dense>
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
 
 #include <cmath>
 #include <limits>
@@ -108,6 +113,9 @@ public:
     }
     markers_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>("cluster_boxes", qos);
 
+    // 记录输出：record/cluster/<启动时间>.csv
+    initRecording();
+
     const auto period = std::chrono::duration<double>(1.0 / std::max(0.1, publish_rate_hz_));
     timer_ = this->create_wall_timer(
       std::chrono::duration_cast<std::chrono::nanoseconds>(period),
@@ -115,6 +123,232 @@ public:
   }
 
 private:
+  struct TrackUpdateResult
+  {
+    std::vector<Eigen::Vector2d> filtered_xy;
+    std::vector<int> track_ids;
+  };
+
+  struct Kalman2D
+  {
+    Eigen::Vector4d x = Eigen::Vector4d::Zero();
+    Eigen::Matrix4d P = Eigen::Matrix4d::Identity();
+    bool initialized = false;
+
+    void init(double px, double py)
+    {
+      x << px, py, 0.0, 0.0;
+      P.setIdentity();
+      P(0, 0) = 1.0;
+      P(1, 1) = 1.0;
+      P(2, 2) = 10.0;
+      P(3, 3) = 10.0;
+      initialized = true;
+    }
+
+    void predict(double dt, double process_noise)
+    {
+      if (!initialized) {
+        return;
+      }
+
+      Eigen::Matrix4d F = Eigen::Matrix4d::Identity();
+      F(0, 2) = dt;
+      F(1, 3) = dt;
+      x = F * x;
+
+      const double q = process_noise;
+      const double dt2 = dt * dt;
+      const double dt3 = dt2 * dt;
+      const double dt4 = dt2 * dt2;
+      Eigen::Matrix4d Q = Eigen::Matrix4d::Zero();
+      Q(0, 0) = dt4 / 4.0 * q;
+      Q(0, 2) = dt3 / 2.0 * q;
+      Q(1, 1) = dt4 / 4.0 * q;
+      Q(1, 3) = dt3 / 2.0 * q;
+      Q(2, 0) = dt3 / 2.0 * q;
+      Q(2, 2) = dt2 * q;
+      Q(3, 1) = dt3 / 2.0 * q;
+      Q(3, 3) = dt2 * q;
+
+      P = F * P * F.transpose() + Q;
+    }
+
+    void update(double meas_x, double meas_y, double meas_noise)
+    {
+      if (!initialized) {
+        init(meas_x, meas_y);
+        return;
+      }
+
+      Eigen::Matrix<double, 2, 4> H;
+      H.setZero();
+      H(0, 0) = 1.0;
+      H(1, 1) = 1.0;
+
+      Eigen::Vector2d z;
+      z << meas_x, meas_y;
+
+      Eigen::Matrix2d R = Eigen::Matrix2d::Identity() * meas_noise;
+
+      const Eigen::Vector2d y = z - H * x;
+      const Eigen::Matrix2d S = H * P * H.transpose() + R;
+      const Eigen::Matrix<double, 4, 2> K = P * H.transpose() * S.inverse();
+
+      x = x + K * y;
+      const Eigen::Matrix4d I = Eigen::Matrix4d::Identity();
+      P = (I - K * H) * P;
+    }
+
+    double px() const { return x(0); }
+    double py() const { return x(1); }
+  };
+
+  struct Track
+  {
+    int id = 0;
+    Kalman2D kf;
+    rclcpp::Time last_predict_stamp; // 上次预测的时间戳（用于计算预测时的 dt）
+    rclcpp::Time last_update_stamp;  // 上次更新的时间戳（用于判断 track 是否在本帧被更新）
+    int missed = 0;
+  };
+
+  void initRecording()
+  {
+    namespace fs = std::filesystem;
+
+    // 文件名按“程序启动时间”生成
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm{};
+    localtime_r(&t, &tm);
+
+    std::ostringstream oss;
+    oss << std::put_time(&tm, "%Y%m%d_%H%M%S");
+    start_time_str_ = oss.str();
+
+    fs::path dir = fs::path("record") / "cluster";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+
+    record_path_ = (dir / (start_time_str_ + ".csv")).string();
+    record_stream_.open(record_path_, std::ios::out | std::ios::app);
+
+    // 按“帧”记录：一帧一行，robots 字段里并排写多个 robot
+    record_stream_ << "stamp_sec,stamp_nanosec,robots\n";
+    record_stream_.flush();
+
+    RCLCPP_INFO(this->get_logger(), "Kalman记录文件: %s", record_path_.c_str());
+  }
+
+  int createTrack(double x, double y, const rclcpp::Time & stamp)
+  {
+    Track tr;
+    tr.id = next_track_id_++;
+    tr.kf.init(x, y);
+    tr.last_predict_stamp = stamp;
+    tr.last_update_stamp = stamp;
+    tr.missed = 0;
+    tracks_.push_back(tr);
+    return tr.id;
+  }
+
+  TrackUpdateResult updateTracks(const std::vector<Eigen::Vector2d> & measurements, const rclcpp::Time & stamp)
+  {
+    constexpr double kGateDistance = 1.0;         // 匹配门限：测量点与 track 预测点距离超过这个值就不匹配
+    constexpr int kMaxMissed = 200;                // 超过这个帧数未匹配就删除 track
+    constexpr double kProcessNoise = 2.0;         // 调大：允许更快运动
+    constexpr double kMeasurementNoise = 0.05;    // 调大：更不信任观测
+
+    // 返回：每个 measurement 对应的 Kalman 输出 (x,y)
+    TrackUpdateResult result;
+    result.filtered_xy.assign(measurements.size(), Eigen::Vector2d::Zero());
+    result.track_ids.assign(measurements.size(), -1);
+
+    // 1) predict
+    for (auto & tr : tracks_) {
+      double dt = 1.0 / std::max(0.1, publish_rate_hz_);
+      if (tr.last_predict_stamp.nanoseconds() > 0) {
+        dt = (stamp - tr.last_predict_stamp).seconds();
+        if (!(dt > 0.0)) {
+          dt = 1.0 / std::max(0.1, publish_rate_hz_);
+        }
+      }
+      tr.kf.predict(dt, kProcessNoise);
+      tr.last_predict_stamp = stamp;
+    }
+
+    // 2) associate (greedy nearest neighbor)
+    std::vector<int> meas_to_track(measurements.size(), -1);
+    std::vector<bool> track_used(tracks_.size(), false);
+
+    for (std::size_t mi = 0; mi < measurements.size(); ++mi) {
+      const auto & z = measurements[mi];
+      double best_d = std::numeric_limits<double>::infinity();
+      int best_ti = -1;
+      for (std::size_t ti = 0; ti < tracks_.size(); ++ti) {
+        if (track_used[ti]) {
+          continue;
+        }
+        const double dx = tracks_[ti].kf.px() - z.x();
+        const double dy = tracks_[ti].kf.py() - z.y();
+        const double d = std::sqrt(dx * dx + dy * dy);
+        if (d < best_d) {
+          best_d = d;
+          best_ti = static_cast<int>(ti);
+        }
+      }
+      if (best_ti >= 0 && best_d <= kGateDistance) {
+        meas_to_track[mi] = best_ti;
+        track_used[best_ti] = true;
+      }
+    }
+
+    // 3) update matched
+    for (std::size_t mi = 0; mi < measurements.size(); ++mi) {
+      const int ti = meas_to_track[mi];
+      if (ti < 0) {
+        continue;
+      }
+      auto & tr = tracks_[static_cast<std::size_t>(ti)];
+      tr.kf.update(measurements[mi].x(), measurements[mi].y(), kMeasurementNoise);
+      tr.last_update_stamp = stamp;
+      tr.missed = 0;
+
+      result.filtered_xy[mi] = Eigen::Vector2d(tr.kf.px(), tr.kf.py());
+      result.track_ids[mi] = tr.id;
+    }
+
+    // 4) create tracks for unmatched measurements
+    for (std::size_t mi = 0; mi < measurements.size(); ++mi) {
+      if (meas_to_track[mi] >= 0) {
+        continue;
+      }
+      const int new_id = createTrack(measurements[mi].x(), measurements[mi].y(), stamp);
+      const auto & tr = tracks_.back();
+      result.filtered_xy[mi] = Eigen::Vector2d(tr.kf.px(), tr.kf.py());
+      result.track_ids[mi] = new_id;
+    }
+
+    // 5) age / remove
+    for (auto & tr : tracks_) {
+      // 未匹配且本帧也没更新的 track，missed++
+      if (tr.last_update_stamp != stamp) {
+        tr.missed += 1;
+      }
+    }
+
+    tracks_.erase(
+      std::remove_if(
+        tracks_.begin(), tracks_.end(),
+        [&](const Track & tr) {
+          return tr.missed > kMaxMissed;
+        }),
+      tracks_.end());
+
+    return result;
+  }
+
   std::string nextPcdFilePath()
   {
     namespace fs = std::filesystem;
@@ -262,6 +496,11 @@ private:
 
     rclcpp::Time stamp = this->now();
 
+    // 收集被标记为 robot 的观测中心点 (x,y)，用于 Kalman 滤波
+    std::vector<Eigen::Vector2d> robot_measurements;
+    // 每个 robot measurement 对应的文本 marker 在 marker_array 中的下标（用于回填 track_id 标签）
+    std::vector<std::size_t> robot_label_marker_indices;
+
     // 先清空上一次的 marker，避免聚类数量变少时旧框残留
     {
       visualization_msgs::msg::Marker clear;
@@ -297,6 +536,10 @@ private:
                       kRobotMinSizeM = 0.15f;
       const bool is_robot_box = (sx < kRobotMaxSizeM) && (sy < kRobotMaxSizeM) && (sz < kRobotMaxSizeM) &&
                                 (sx > kRobotMinSizeM) && (sz > kRobotMinSizeM);
+
+      if (is_robot_box) {
+        robot_measurements.emplace_back(static_cast<double>(cx), static_cast<double>(cy));
+      }
 
       visualization_msgs::msg::Marker m;
       m.header.frame_id = frame_id_;
@@ -349,17 +592,70 @@ private:
         t.text = std::string("robot_") + std::to_string(robot_num++);
 
         t.lifetime = rclcpp::Duration(0, 0);
+        robot_label_marker_indices.push_back(marker_array.markers.size());
         marker_array.markers.push_back(std::move(t));
       }
+    }
+
+    // Kalman 更新与记录（只针对 robot 观测）
+    const auto track_result = updateTracks(robot_measurements, stamp);
+
+    // 回填 RViz 文本标签：robot_<track_id>
+    for (std::size_t i = 0; i < robot_label_marker_indices.size(); ++i) {
+      const std::size_t mi = i;  // robot_label_marker_indices 与 robot_measurements 同步增长
+      if (mi >= track_result.track_ids.size()) {
+        continue;
+      }
+      const std::size_t marker_i = robot_label_marker_indices[i];
+      if (marker_i >= marker_array.markers.size()) {
+        continue;
+      }
+      const int tid = track_result.track_ids[mi];
+      if (tid >= 0) {
+        marker_array.markers[marker_i].text = std::string("robot_") + std::to_string(tid);
+      }
+    }
+
+    // 同一帧多个 robot：并排拼成一行（label 与 RViz 保持一致：robot_<track_id>）
+    std::string robots_inline;
+    if (!robot_measurements.empty()) {
+      std::ostringstream oss;
+      oss.setf(std::ios::fixed);
+      oss << std::setprecision(2);
+      for (std::size_t i = 0; i < robot_measurements.size(); ++i) {
+        if (i > 0) {
+          oss << " | ";
+        }
+        const int tid = (i < track_result.track_ids.size()) ? track_result.track_ids[i] : -1;
+        const auto & xy = (i < track_result.filtered_xy.size()) ? track_result.filtered_xy[i] : robot_measurements[i];
+        if (tid >= 0) {
+          oss << "robot_" << tid;
+        } else {
+          oss << "robot_" << i;
+        }
+        oss << "=(" << xy.x() << "," << xy.y() << ")";
+      }
+      robots_inline = oss.str();
+    }
+
+    if (record_stream_.is_open()) {
+      // CSV 第三列用引号包住，避免里面的逗号/分隔符影响解析
+      const int64_t stamp_ns = static_cast<int64_t>(stamp.nanoseconds());
+      const int64_t stamp_sec = stamp_ns / 1000000000LL;
+      const int64_t stamp_nanosec = stamp_ns % 1000000000LL;
+      record_stream_ << stamp_sec << "," << stamp_nanosec << ",\"" << robots_inline << "\"\n";
+      record_stream_.flush();
     }
 
     markers_pub_->publish(marker_array);
 
     RCLCPP_INFO(
       this->get_logger(),
-      "发布点云：聚类框=%zu，robot标签=%u。PCD路径=%s",
+      "发布点云：聚类框=%zu，robot标签=%u%s%s。PCD路径=%s",
       cluster_indices.size(),
       robot_num,
+      robots_inline.empty() ? "" : "，",
+      robots_inline.c_str(),
       pcd_file.c_str());
   }
 
@@ -401,6 +697,13 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr filtered_cloud_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr markers_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
+
+  // Kalman tracking + recording
+  std::string start_time_str_;
+  std::string record_path_;
+  std::ofstream record_stream_;
+  int next_track_id_{0};
+  std::vector<Track> tracks_;
 };
 
 int main(int argc, char ** argv)
