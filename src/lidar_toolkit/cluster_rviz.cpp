@@ -619,21 +619,51 @@ private:
     // 同一帧多个 robot：并排拼成一行（label 与 RViz 保持一致：robot_<track_id>）
     std::string robots_inline;
     if (!robot_measurements.empty()) {
+      struct RobotPrintItem
+      {
+        int track_id;
+        Eigen::Vector2d xy;
+        std::size_t fallback_index;
+      };
+
+      // 准备待排序的 robot 项目列表
+      std::vector<RobotPrintItem> items;
+      items.reserve(robot_measurements.size());
+      for (std::size_t i = 0; i < robot_measurements.size(); ++i) {
+        const int tid = (i < track_result.track_ids.size()) ? track_result.track_ids[i] : -1;
+        const auto xy = (i < track_result.filtered_xy.size()) ? track_result.filtered_xy[i] : robot_measurements[i];
+        items.push_back(RobotPrintItem{tid, xy, i});
+      }
+
+      // 排序：先按 track_id（有的在前），再按 track_id 数值（小的在前），最后按原始顺序（fallback_index）
+      std::sort(
+        items.begin(), items.end(),
+        [](const RobotPrintItem & a, const RobotPrintItem & b) {
+          const bool a_valid = a.track_id >= 0;
+          const bool b_valid = b.track_id >= 0;
+          if (a_valid != b_valid) {
+            return a_valid;  // 先输出有 track_id 的
+          }
+          if (a_valid && b_valid) {
+            return a.track_id < b.track_id;
+          }
+          return a.fallback_index < b.fallback_index;
+        });
+
       std::ostringstream oss;
       oss.setf(std::ios::fixed);
       oss << std::setprecision(2);
-      for (std::size_t i = 0; i < robot_measurements.size(); ++i) {
+      for (std::size_t i = 0; i < items.size(); ++i) {
         if (i > 0) {
           oss << " | ";
         }
-        const int tid = (i < track_result.track_ids.size()) ? track_result.track_ids[i] : -1;
-        const auto & xy = (i < track_result.filtered_xy.size()) ? track_result.filtered_xy[i] : robot_measurements[i];
-        if (tid >= 0) {
-          oss << "robot_" << tid;
+        const auto & it = items[i];
+        if (it.track_id >= 0) {
+          oss << "robot_" << it.track_id;
         } else {
-          oss << "robot_" << i;
+          oss << "robot_" << it.fallback_index;
         }
-        oss << "=(" << xy.x() << "," << xy.y() << ")";
+        oss << "=(" << it.xy.x() << "," << it.xy.y() << ")";
       }
       robots_inline = oss.str();
     }
