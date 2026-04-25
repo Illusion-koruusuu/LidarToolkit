@@ -1,9 +1,14 @@
 #include <iostream>
 #include <string>
 #include <algorithm>
+#include <cmath>
+#include <cerrno>
+#include <cstdlib>
+#include <limits>
 #include <sys/stat.h>
 #include <ctime>
 #include <iomanip>
+#include <sstream>
 
 #include <pcl/io/ply_io.h>
 #include <pcl/io/pcd_io.h>
@@ -19,6 +24,46 @@ typedef pcl::PointCloud<PointT> PointCloudT;
 
 
 bool next_iteration = false;
+
+static bool tryParseInt(const char* s, int& out)
+{
+  if (s == nullptr || *s == '\0')
+    return false;
+  char* end = nullptr;
+  errno = 0;
+  long v = std::strtol(s, &end, 10);
+  if (errno != 0 || end == s || *end != '\0')
+    return false;
+  if (v < std::numeric_limits<int>::min() || v > std::numeric_limits<int>::max())
+    return false;
+  out = static_cast<int>(v);
+  return true;
+}
+
+static bool tryParseFloat(const char* s, float& out)
+{
+  if (s == nullptr || *s == '\0')
+    return false;
+  char* end = nullptr;
+  errno = 0;
+  float v = std::strtof(s, &end);
+  if (errno != 0 || end == s || *end != '\0')
+    return false;
+  out = v;
+  return true;
+}
+
+static Eigen::Matrix4f buildGuessPose(float tx, float ty, float tz, float yaw_rad)
+{
+  const Eigen::AngleAxisf rz(yaw_rad, Eigen::Vector3f::UnitZ());
+
+  Eigen::Matrix4f guess = Eigen::Matrix4f::Identity();
+  guess.block<3, 3>(0, 0) = rz.toRotationMatrix();
+  guess(0, 3) = tx;
+  guess(1, 3) = ty;
+  guess(2, 3) = tz;
+  return guess;
+}
 
 void
 print4x4Matrix (const Eigen::Matrix4d & matrix)
@@ -138,21 +183,55 @@ main (int argc,
   if (argc < 3)
   {
     printf ("Usage :\n");
-    printf ("\t\t%s file.ply/pcd number_of_ICP_iterations\n", argv[0]);
+    printf ("\t\t%s source.ply/pcd target.ply/pcd [number_of_ICP_iterations] [x y z yaw_deg]\n", argv[0]);
+    printf ("\t\tyaw unit: degrees.\n");
     PCL_ERROR ("Provide two ply/pcd files.\n");
     return (-1);
   }
 
   int iterations = 1;  // Default number of ICP iterations
-  if (argc > 3)
+  bool use_guess = false;
+  Eigen::Matrix4f guess_pose = Eigen::Matrix4f::Identity();
+
+  int argi = 3;  // argv[1], argv[2] are source/target
+  if (argc > argi)
   {
-    // If the user passed the number of iteration as an argument
-    iterations = atoi (argv[argc - 1]);
-    if (iterations < 1)
+    int parsed_iterations = 0;
+    // Optional iterations: only consume argv[3] if it is a valid integer.
+    if (tryParseInt(argv[argi], parsed_iterations))
     {
-      PCL_ERROR ("Number of initial iterations must be >= 1\n");
+      iterations = parsed_iterations;
+      argi++;
+      if (iterations < 1)
+      {
+        PCL_ERROR ("Number of initial iterations must be >= 1\n");
+        return (-1);
+      }
+    }
+  }
+
+  int remaining = argc - argi;
+  if (remaining != 0 && remaining != 4)
+  {
+    PCL_ERROR ("Invalid arguments. Expected either no guess or 4 guess parameters: x y z yaw_deg\n");
+    return (-1);
+  }
+
+  if (remaining == 4)
+  {
+    float x, y, z, yaw_deg;
+    if (!tryParseFloat(argv[argi + 0], x) ||
+        !tryParseFloat(argv[argi + 1], y) ||
+        !tryParseFloat(argv[argi + 2], z) ||
+        !tryParseFloat(argv[argi + 3], yaw_deg))
+    {
+      PCL_ERROR ("Failed to parse guess parameters. Expect float values: x y z yaw_deg\n");
       return (-1);
     }
+    constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
+    const float yaw_rad = yaw_deg * kDegToRad;
+    guess_pose = buildGuessPose(x, y, z, yaw_rad);
+    use_guess = true;
   }
 
   
@@ -172,7 +251,15 @@ main (int argc,
   icp.setMaximumIterations (iterations);
   icp.setInputSource (cloud_in);
   icp.setInputTarget (cloud_ori);
-  icp.align (*cloud_icp);
+  if (use_guess)
+  {
+    std::cout << "Use initial guess pose for ICP alignment." << std::endl;
+    icp.align (*cloud_icp, guess_pose);
+  }
+  else
+  {
+    icp.align (*cloud_icp);
+  }
   icp.setMaximumIterations (1);  // We set this variable to 1 for the next time we will call .align () function
   std::cout << "Applied " << iterations << " ICP iteration(s) in " << time.toc () << " ms" << std::endl;
 
