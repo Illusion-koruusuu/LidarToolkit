@@ -7,7 +7,12 @@ find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(pcl_conversions REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_ros REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
 find_package(PCL 1.5 REQUIRED)
+
 set(CMAKE_CXX_STANDARD 17)
 
 include_directories(${PCL_INCLUDE_DIRS})
@@ -19,6 +24,8 @@ set(EXECUTABLES
 	tailor
 	cluster_extraction
 	cluster_rviz
+	ndt
+	plane_pose_estimation
 )
 
 foreach(exec ${EXECUTABLES})
@@ -29,6 +36,10 @@ foreach(exec ${EXECUTABLES})
 		sensor_msgs
 		visualization_msgs
 		pcl_conversions
+		tf2
+		tf2_ros
+		tf2_geometry_msgs
+		geometry_msgs
 	)
 endforeach()
 
