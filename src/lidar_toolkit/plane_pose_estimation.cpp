@@ -62,6 +62,16 @@
 typedef pcl::PointXYZ PointT;
 typedef pcl::PointCloud<PointT> PointCloudT;
 
+// ========== 目标平面尺寸（毫米） ==========
+// 期望的长（x方向，平面平行方向）和宽（z方向，高度），误差 ±200mm
+static constexpr float kTargetLengthM = 6.130f;  // 6130mm
+static constexpr float kTargetWidthM  = 0.770f;  // 770mm
+static constexpr float kSizeToleranceM = 0.200f;  // ±200mm
+
+// 网左侧在地图坐标系下的坐标
+static constexpr float kNetLeftX = 0.58f; // 米
+static constexpr float kNetLeftY = 7.85f;  // 米
+
 // ========== 参数解析辅助函数 ==========
 
 static bool tryParseFloat(const char* s, float& out)
@@ -150,11 +160,6 @@ static void removePlaneOutliers(const PointCloudT::Ptr& cloud_in,
             << " (radius=" << radius << "m, min_neighbors=" << min_neighbors << ")" << std::endl;
 }
 
-// ========== 目标平面尺寸（毫米） ==========
-// 期望的长（x方向，平面平行方向）和宽（z方向，高度），误差 ±200mm
-static constexpr float kTargetLengthM = 6.130f;  // 6130mm
-static constexpr float kTargetWidthM  = 0.770f;  // 770mm
-static constexpr float kSizeToleranceM = 0.200f;  // ±200mm
 
 // ========== 平面点云 bounding box ==========
 
@@ -956,42 +961,6 @@ int main(int argc, char* argv[])
   }
   printPose(pose);
 
-  // ===== 5.5 直接使用 Eigen 计算 baselink 在 map 下的位姿 =====
-  Eigen::Vector3f T_bl_map = Eigen::Vector3f::Zero();
-  Eigen::Matrix3f R_bl_map = Eigen::Matrix3f::Identity();
-  
-  {
-    // 1) map -> net 的静态变换 (T_map_net)
-    Eigen::Vector3f t_map_net(0.58f, 7.85f, 0.0f);
-    Eigen::Matrix3f R_map_net = Eigen::Matrix3f::Identity(); // 旋转为0
-
-    // 2) baselink -> net 的变换 (T_baselink_net)
-    Eigen::Vector3f t_bl_net = pose.position;
-    Eigen::Matrix3f R_bl_net = pose.rotation;
-
-    // 3) 计算 net -> baselink 的逆变换 (T_net_baselink)
-    Eigen::Matrix3f R_net_bl = R_bl_net.transpose();
-    Eigen::Vector3f t_net_bl = -R_net_bl * t_bl_net;
-
-    // 4) 矩阵乘法：T_map_baselink = T_map_net * T_net_baselink
-    R_bl_map = R_map_net * R_net_bl;
-    T_bl_map = R_map_net * t_net_bl + t_map_net;
-
-    float yaw = std::atan2(R_bl_map(1, 0), R_bl_map(0, 0));
-
-    printf("\n  === baselink pose in map frame (Calculated via Eigen) ===\n");
-    printf("    Translation (x, y, z): %.6f, %.6f, %.6f\n",
-           T_bl_map.x(), T_bl_map.y(), T_bl_map.z());
-    printf("    yaw: %.6f rad (%.3f deg)\n", yaw, yaw * 180.0f / M_PI);
-    printf("    Rotation matrix (baselink -> map):\n");
-    printf("      [%8.6f, %8.6f, %8.6f]\n",
-           R_bl_map(0, 0), R_bl_map(0, 1), R_bl_map(0, 2));
-    printf("      [%8.6f, %8.6f, %8.6f]\n",
-           R_bl_map(1, 0), R_bl_map(1, 1), R_bl_map(1, 2));
-    printf("      [%8.6f, %8.6f, %8.6f]\n",
-           R_bl_map(2, 0), R_bl_map(2, 1), R_bl_map(2, 2));
-  }
-
   // ===== 6. Compute plane bounding box =====
   PlaneBBox bbox = computePlaneBBox(plane_cloud, pose);
 
@@ -1025,14 +994,64 @@ int main(int argc, char* argv[])
     avg_normal /= static_cast<float>(left_walls.size());
     printf("    Average: [%+.6f, %+.6f, %+.6f] (norm=%.6f)\n",
            avg_normal.x(), avg_normal.y(), avg_normal.z(), avg_normal.norm());
-  }
+  
 
-  // ===== 8. Visualization =====
-  if (!no_viz)
-  {
-    visualize(cloud, cloud_cropped, plane_cloud, pose, bbox, axis_length, exact_match,
-              T_bl_map, R_bl_map, left_walls);
+    // ===== 5.5 直接使用 Eigen 计算 baselink 在 map 下的位姿 =====
+    Eigen::Vector3f T_bl_map = Eigen::Vector3f::Zero();
+    Eigen::Matrix3f R_bl_map = Eigen::Matrix3f::Identity();
+    
+    {
+      // 1) map -> net 的静态变换 (T_map_net)
+      Eigen::Vector3f t_map_net(kNetLeftX, kNetLeftY, 0.0f);
+      Eigen::Matrix3f R_map_net = Eigen::Matrix3f::Identity(); // 旋转为0
+
+      // 2) baselink -> net 的变换 (T_baselink_net)
+      Eigen::Vector3f t_bl_net = pose.position;
+      // 使用左侧墙来修正网的角度
+      Eigen::Matrix3f R_bl_net;
+      Eigen::Vector3f x_axis(avg_normal.x(), avg_normal.y(), 0.0f); // 墙的法向量投影到XY平面
+      x_axis.normalize();
+      // Y 轴 = X 轴逆时针转90度
+      Eigen::Vector3f y_axis(-x_axis.y(), x_axis.x(), 0.0f);
+      y_axis.normalize();
+      // Z 轴 = (0,0,1)
+      Eigen::Vector3f z_axis(0.0f, 0.0f, 1.0f);
+      R_bl_net.col(0) = x_axis;
+      R_bl_net.col(1) = y_axis;
+      R_bl_net.col(2) = z_axis;
+
+      // 3) 计算 net -> baselink 的逆变换 (T_net_baselink)
+      Eigen::Matrix3f R_net_bl = R_bl_net.transpose();
+      Eigen::Vector3f t_net_bl = -R_net_bl * t_bl_net;
+
+      // 4) 矩阵乘法：T_map_baselink = T_map_net * T_net_baselink
+      R_bl_map = R_map_net * R_net_bl;
+      T_bl_map = R_map_net * t_net_bl + t_map_net;
+
+      float yaw = std::atan2(R_bl_map(1, 0), R_bl_map(0, 0));
+
+      printf("\n  === baselink pose in map frame (Calculated via Eigen) ===\n");
+      printf("    Translation (x, y, z): %.6f, %.6f, %.6f\n",
+            T_bl_map.x(), T_bl_map.y(), T_bl_map.z());
+      printf("    yaw: %.6f rad (%.3f deg)\n", yaw, yaw * 180.0f / M_PI);
+      printf("    Rotation matrix (baselink -> map):\n");
+      printf("      [%8.6f, %8.6f, %8.6f]\n",
+            R_bl_map(0, 0), R_bl_map(0, 1), R_bl_map(0, 2));
+      printf("      [%8.6f, %8.6f, %8.6f]\n",
+            R_bl_map(1, 0), R_bl_map(1, 1), R_bl_map(1, 2));
+      printf("      [%8.6f, %8.6f, %8.6f]\n",
+            R_bl_map(2, 0), R_bl_map(2, 1), R_bl_map(2, 2));
+    }
+
+    // ===== 8. Visualization =====
+    if (!no_viz)
+    {
+      visualize(cloud, cloud_cropped, plane_cloud, pose, bbox, axis_length, exact_match,
+                T_bl_map, R_bl_map, left_walls);
+    }
+
   }
+  
 
   rclcpp::shutdown();
   return 0;
