@@ -156,14 +156,94 @@ static constexpr float kTargetLengthM = 6.130f;  // 6130mm
 static constexpr float kTargetWidthM  = 0.770f;  // 770mm
 static constexpr float kSizeToleranceM = 0.200f;  // ±200mm
 
+// ========== 平面点云 bounding box ==========
+
+struct PlaneBBox
+{
+  // 8 个角点（世界坐标系下）
+  Eigen::Vector3f corners[8];
+  // 平面坐标系下的范围
+  float x_min, x_max, y_min, y_max, z_min, z_max;
+};
+
+// ========== 左侧墙面数据结构 ==========
+
+struct LeftWall
+{
+  PointCloudT::Ptr plane_cloud;
+  pcl::ModelCoefficients coefficients;
+  PlaneBBox bbox;
+  int index; // 墙面编号
+};
+
+// ========== 辅助：为垂直平面计算 PlaneBBox ==========
+
+static bool computeBBoxForVerticalPlane(const PointCloudT::Ptr& cloud,
+                                         const pcl::ModelCoefficients& coeffs,
+                                         PlaneBBox& bbox)
+{
+  Eigen::Vector3f normal(coeffs.values[0], coeffs.values[1], coeffs.values[2]);
+  normal.normalize();
+
+  Eigen::Vector3f y_axis(normal.x(), normal.y(), 0.0f);
+  float yn = y_axis.norm();
+  if (yn < 1e-10f)
+    return false;
+  y_axis.normalize();
+  Eigen::Vector3f x_axis(-y_axis.y(), y_axis.x(), 0.0f);
+  Eigen::Vector3f z_axis(0, 0, 1);
+
+  Eigen::Matrix3f R;
+  R.col(0) = x_axis;
+  R.col(1) = y_axis;
+  R.col(2) = z_axis;
+
+  bbox.x_min = bbox.y_min = bbox.z_min = std::numeric_limits<float>::max();
+  bbox.x_max = bbox.y_max = bbox.z_max = -std::numeric_limits<float>::max();
+  for (const auto& pt : cloud->points)
+  {
+    Eigen::Vector3f p_local = R.transpose() * Eigen::Vector3f(pt.x, pt.y, pt.z);
+    if (p_local.x() < bbox.x_min) bbox.x_min = p_local.x();
+    if (p_local.x() > bbox.x_max) bbox.x_max = p_local.x();
+    if (p_local.y() < bbox.y_min) bbox.y_min = p_local.y();
+    if (p_local.y() > bbox.y_max) bbox.y_max = p_local.y();
+    if (p_local.z() < bbox.z_min) bbox.z_min = p_local.z();
+    if (p_local.z() > bbox.z_max) bbox.z_max = p_local.z();
+  }
+
+  float lx[2] = {bbox.x_min, bbox.x_max};
+  float ly[2] = {bbox.y_min, bbox.y_max};
+  float lz[2] = {bbox.z_min, bbox.z_max};
+  int idx = 0;
+  for (int i = 0; i < 2; ++i)
+    for (int j = 0; j < 2; ++j)
+      for (int k = 0; k < 2; ++k)
+        bbox.corners[idx++] = R * Eigen::Vector3f(lx[i], ly[j], lz[k]);
+
+  return true;
+}
+
+// ========== 辅助：判断平面重心是否在 baselink 左侧 (x < 0) ==========
+
+static bool isOnLeftSide(const PointCloudT::Ptr& cloud)
+{
+  float cx = 0.0f;
+  for (const auto& pt : cloud->points)
+    cx += pt.x;
+  cx /= static_cast<float>(cloud->size());
+  return cx < 0.0f;
+}
+
 // ========== 迭代分割平面，找到尺寸匹配目标的平面 ==========
 
 // 返回值: 1=精确匹配, 0=未匹配但返回最佳候选, -1=无可用平面
+// 同时收集左侧 (x<0) 的垂直墙面到 left_walls
 static int segmentTargetPlane(const PointCloudT::Ptr& cloud,
                                PointCloudT::Ptr& plane_cloud,
                                pcl::ModelCoefficients& coefficients,
                                float distance_threshold,
                                int max_iterations,
+                               std::vector<LeftWall>& left_walls,
                                bool filter_outliers = true,
                                float outlier_radius = 0.1f,
                                int outlier_min_neighbors = 5,
@@ -310,6 +390,27 @@ static int segmentTargetPlane(const PointCloudT::Ptr& cloud,
       has_best = true;
     }
 
+    // 如果该平面位于 baselink 左侧 (x < 0)，收集为左侧墙面
+    if (isOnLeftSide(current_plane))
+    {
+      PlaneBBox wall_bbox;
+      if (computeBBoxForVerticalPlane(current_plane, coeffs, wall_bbox))
+      {
+        LeftWall wall;
+        wall.plane_cloud = current_plane;
+        wall.coefficients = coeffs;
+        wall.bbox = wall_bbox;
+        wall.index = static_cast<int>(left_walls.size());
+        left_walls.push_back(wall);
+
+        float w_len = wall_bbox.x_max - wall_bbox.x_min;
+        float w_hgt = wall_bbox.z_max - wall_bbox.z_min;
+        std::cout << "    [left wall #" << wall.index
+                  << "] length(x)=" << w_len << "m"
+                  << ", height(z)=" << w_hgt << "m" << std::endl;
+      }
+    }
+
     // 移除当前平面，继续找下一个
     {
       pcl::ExtractIndices<PointT> extract;
@@ -440,14 +541,6 @@ static bool computePlanePose(const PointCloudT::Ptr& plane_cloud,
 }
 
 // ========== 计算平面点云的 bounding box 角点（在平面坐标系下）==========
-
-struct PlaneBBox
-{
-  // 8 个角点（世界坐标系下）
-  Eigen::Vector3f corners[8];
-  // 平面坐标系下的范围
-  float x_min, x_max, y_min, y_max, z_min, z_max;
-};
 
 static PlaneBBox computePlaneBBox(const PointCloudT::Ptr& plane_cloud,
                                   const PlanePose& pose)
@@ -592,7 +685,8 @@ static void visualize(const PointCloudT::Ptr& cloud_original,
                       float axis_length,
                       bool exact_match,
                       const Eigen::Vector3f& map_position,
-                      const Eigen::Matrix3f& map_rotation)
+                      const Eigen::Matrix3f& map_rotation,
+                      const std::vector<LeftWall>& left_walls)
 {
   std::string title = exact_match ? "Plane Pose Estimation [MATCHED]"
                                   : "Plane Pose Estimation [BEST CANDIDATE - no exact match]";
@@ -613,6 +707,44 @@ static void visualize(const PointCloudT::Ptr& cloud_original,
 
   // 3) Plane bounding box - yellow wireframe
   addBoundingBox(viewer, bbox, "plane_bbox");
+
+  // 3.5) Left wall point clouds (magenta) and bounding boxes (magenta wireframe)
+  for (const auto& wall : left_walls)
+  {
+    std::string wall_prefix = "left_wall_" + std::to_string(wall.index);
+
+    // 墙面点云 - 紫色
+    pcl::visualization::PointCloudColorHandlerCustom<PointT> wall_color(wall.plane_cloud, 200, 50, 200);
+    viewer.addPointCloud<PointT>(wall.plane_cloud, wall_color, wall_prefix + "_cloud");
+    viewer.setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE, 2, wall_prefix + "_cloud");
+
+    // 墙面 bounding box - 品红色线框
+    const auto& wbbox = wall.bbox;
+    const int edges[12][2] = {
+      {0, 1}, {0, 2}, {0, 4}, {1, 3}, {1, 5},
+      {2, 3}, {2, 6}, {3, 7}, {4, 5}, {4, 6},
+      {5, 7}, {6, 7}
+    };
+    for (int e = 0; e < 12; ++e)
+    {
+      const auto& c0 = wbbox.corners[edges[e][0]];
+      const auto& c1 = wbbox.corners[edges[e][1]];
+      pcl::PointXYZ p0(c0.x(), c0.y(), c0.z());
+      pcl::PointXYZ p1(c1.x(), c1.y(), c1.z());
+      std::string eid = wall_prefix + "_edge_" + std::to_string(e);
+      viewer.addLine(p0, p1, 1.0, 0.0, 1.0, eid); // 品红色
+      viewer.setShapeRenderingProperties(pcl::visualization::PCL_VISUALIZER_LINE_WIDTH, 2, eid);
+    }
+
+    // 墙面编号标签（在 bbox 中心偏上）
+    Eigen::Vector3f center(
+      (wbbox.corners[0].x() + wbbox.corners[7].x()) * 0.5f,
+      (wbbox.corners[0].y() + wbbox.corners[7].y()) * 0.5f,
+      (wbbox.corners[0].z() + wbbox.corners[7].z()) * 0.5f);
+    std::string label = "W" + std::to_string(wall.index);
+    viewer.addText3D(label, pcl::PointXYZ(center.x(), center.y(), center.z() + 0.2f),
+                     0.2, 1.0, 0.0, 1.0, wall_prefix + "_label");
+  }
 
   // 4) net coordinate system (at net origin) - Red(X: Xmin->Xmax) Green(Y) Blue(Z: up)
   addCoordinateAxes(viewer, pose.position, pose.x_axis, pose.y_axis, pose.z_axis,
@@ -659,6 +791,8 @@ static void visualize(const PointCloudT::Ptr& cloud_original,
                  1.0, 1.0, 1.0, "legend");
   viewer.addText("Red=X(Xmin->Xmax) Green=Y Blue=Z(up) | Half-length axes=baselink | 0.6x axes=map frame", 10, 45, 14,
                  1.0, 1.0, 1.0, "legend2");
+  viewer.addText("Magenta: left wall (x<0) | Magenta box: wall bbox", 10, 70, 14,
+                 1.0, 1.0, 1.0, "legend3");
 
   // Set initial viewpoint
   viewer.setCameraPosition(0.0, -8.0, 5.0,  0.0, 0.0, 1.0,  0.0, -1.0, 0.0);
@@ -802,8 +936,10 @@ int main(int argc, char* argv[])
 
   PointCloudT::Ptr plane_cloud(new PointCloudT);
   pcl::ModelCoefficients coefficients;
+  std::vector<LeftWall> left_walls;
   int seg_result = segmentTargetPlane(cloud_cropped, plane_cloud, coefficients,
                                        distance_threshold, ransac_iterations,
+                                       left_walls,
                                        filter_outliers, outlier_radius, outlier_min_neighbors);
   if (seg_result < 0)
   {
@@ -870,11 +1006,32 @@ int main(int argc, char* argv[])
   printf("  y: [%.4f, %.4f]\n", bbox.y_min, bbox.y_max);
   printf("  z: [%.4f, %.4f]\n", bbox.z_min, bbox.z_max);
 
+  // ===== 7.5. Left walls collected during plane segmentation =====
+  std::cout << "\nTotal left walls (x < 0) detected: " << left_walls.size() << std::endl;
+
+  if (!left_walls.empty())
+  {
+    printf("\n  === Left Wall Normals ===\n");
+    Eigen::Vector3f avg_normal(0, 0, 0);
+    for (const auto& wall : left_walls)
+    {
+      Eigen::Vector3f n(wall.coefficients.values[0],
+                        wall.coefficients.values[1],
+                        wall.coefficients.values[2]);
+      n.normalize();
+      printf("    Wall %d: [%+.6f, %+.6f, %+.6f]\n", wall.index, n.x(), n.y(), n.z());
+      avg_normal += n;
+    }
+    avg_normal /= static_cast<float>(left_walls.size());
+    printf("    Average: [%+.6f, %+.6f, %+.6f] (norm=%.6f)\n",
+           avg_normal.x(), avg_normal.y(), avg_normal.z(), avg_normal.norm());
+  }
+
   // ===== 8. Visualization =====
   if (!no_viz)
   {
     visualize(cloud, cloud_cropped, plane_cloud, pose, bbox, axis_length, exact_match,
-              T_bl_map, R_bl_map);
+              T_bl_map, R_bl_map, left_walls);
   }
 
   rclcpp::shutdown();
